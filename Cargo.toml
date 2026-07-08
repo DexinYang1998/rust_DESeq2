@@ -1,0 +1,18 @@
+[package]
+name = "rust_deseq2"
+version = "0.1.0"
+edition = "2021"
+description = "A from-scratch Rust reimplementation of the core DESeq2 differential expression workflow"
+
+[[bin]]
+name = "rust_deseq2"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally dependency-free: all numerics (GLM/IRLS, linear algebra,
+# special functions, statistics) are implemented in pure std Rust so the
+# binary builds offline and has no external footprint.
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,50 @@
+# Rust build outputs
+target/
+**/target/
+
+# Python/R/cache
+__pycache__/
+*.pyc
+.Rhistory
+.RData
+.Rproj.user/
+
+# Conda/env
+.conda/
+env/
+venv/
+
+# Large data / outputs
+data/
+datasets/
+results/
+result/
+output/
+outputs/
+tmp/
+temp/
+logs/
+*.log
+
+# Large bioinformatics files
+*.bam
+*.bai
+*.cram
+*.crai
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
+*.h5
+*.hdf5
+*.rds
+*.rda
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.gz
+
+# System
+.DS_Store
