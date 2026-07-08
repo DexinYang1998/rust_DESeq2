@@ -1,10 +1,16 @@
 #!/usr/bin/env Rscript
 # Wall-clock comparison of rust_deseq2 vs. Bioconductor DESeq2 on each dataset.
-# Measures the core compute (DESeq() + results() for R; the binary for rust).
+# Measures DESeq2 core compute (DESeq() + results()) and rust full CLI runtime
+# (TSV read + compute + TSV write). Reports best-of-N elapsed seconds.
 suppressMessages(library(DESeq2))
 
-proj <- "/data/dyang11/software/rewrite_package/rust_deseq2"
-bin  <- file.path(proj, "target/release/rust_deseq2")
+script_file <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE)[1])
+script_dir <- if (!is.na(script_file)) dirname(normalizePath(script_file)) else getwd()
+proj <- normalizePath(file.path(script_dir, ".."))
+bin <- Sys.getenv("RUST_DESEQ2_BIN", file.path(proj, "target/release/rust_deseq2"))
+if (!file.exists(bin)) {
+  stop("rust_deseq2 binary not found: ", bin, "\nRun `cargo build --release` first.")
+}
 
 datasets <- list(
   c("small (400x12)",  "gene_counts.tsv",  "sample_metadata.tsv"),
@@ -12,9 +18,33 @@ datasets <- list(
   c("u4v12 (15kx16)",  "u4v12_counts.tsv", "u4v12_metadata.tsv")
 )
 
-reps <- 3
-cat(sprintf("%-18s %8s %10s %10s %9s\n", "dataset", "genes", "DESeq2(s)", "rust(s)", "speedup"))
-cat(strrep("-", 60), "\n")
+args <- commandArgs(trailingOnly = TRUE)
+reps <- if (length(args) >= 1) as.integer(args[1]) else 3L
+if (is.na(reps) || reps < 1L) stop("first argument, if supplied, must be repetitions >= 1")
+
+bench_rust <- function(cf, mf, threads, reps) {
+  out <- tempfile(fileext = ".tsv")
+  on.exit(unlink(out), add = TRUE)
+  best <- Inf
+  for (r in seq_len(reps)) {
+    cli <- c("--counts", cf, "--coldata", mf, "--design", "group",
+             "--contrast-case", "tumor", "--contrast-control", "normal",
+             "--threads", as.character(threads),
+             "--out", out)
+    elapsed <- system.time({
+      status <- system2(bin, cli, stdout = FALSE, stderr = FALSE)
+      if (!identical(status, 0L)) stop("rust_deseq2 failed with status ", status)
+    })["elapsed"]
+    best <- min(best, as.numeric(elapsed))
+  }
+  best
+}
+
+cat(sprintf("project: %s\nbinary:  %s\nreps:    %d (best elapsed seconds)\n\n",
+            proj, bin, reps))
+cat(sprintf("%-18s %8s %10s %11s %11s %10s\n",
+            "dataset", "genes", "DESeq2", "rust_1thr", "rust_auto", "auto_speedup"))
+cat(strrep("-", 76), "\n")
 
 for (ds in datasets) {
   name <- ds[1]
@@ -29,26 +59,17 @@ for (ds in datasets) {
   # DESeq2 core compute (exclude file reading), best of `reps`.
   ds_t <- Inf
   for (r in seq_len(reps)) {
-    t <- system.time({
+    elapsed <- system.time({
       dds <- DESeqDataSetFromMatrix(cts, meta, ~ group)
       dds <- DESeq(dds, quiet = TRUE)
       invisible(results(dds, contrast = c("group", "tumor", "normal")))
     })["elapsed"]
-    ds_t <- min(ds_t, as.numeric(t))
+    ds_t <- min(ds_t, as.numeric(elapsed))
   }
 
-  # rust full pipeline (includes TSV read/write), best of `reps`.
-  out <- tempfile(fileext = ".tsv")
-  rust_t <- Inf
-  for (r in seq_len(reps)) {
-    t <- system.time({
-      system2(bin, c("--counts", cf, "--coldata", mf, "--design", "group",
-                     "--contrast-case", "tumor", "--contrast-control", "normal",
-                     "--out", out), stdout = FALSE, stderr = FALSE)
-    })["elapsed"]
-    rust_t <- min(rust_t, as.numeric(t))
-  }
+  rust_1 <- bench_rust(cf, mf, threads = 1L, reps = reps)
+  rust_auto <- bench_rust(cf, mf, threads = 0L, reps = reps)
 
-  cat(sprintf("%-18s %8d %10.2f %10.2f %8.1fx\n",
-              name, nrow(cts), ds_t, rust_t, ds_t / rust_t))
+  cat(sprintf("%-18s %8d %10.2f %11.2f %11.2f %9.1fx\n",
+              name, nrow(cts), ds_t, rust_1, rust_auto, ds_t / rust_auto))
 }

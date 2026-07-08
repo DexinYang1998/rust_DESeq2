@@ -36,6 +36,7 @@ Optional arguments:
   --sample-col   <col>   colData column holding sample ids (default: 1st col)
   --out          <path>  output TSV (default: results.tsv)
   --threads      <n>     worker threads (default: auto = cores, capped at 16)
+  --dump-prefix  <path>  write intermediate diagnostics to <path>.*.tsv
   -h, --help             show this help
 "
     .to_string()
@@ -45,7 +46,9 @@ Optional arguments:
 fn take(args: &[String], i: &mut usize) -> Result<String, String> {
     let flag = args[*i].clone();
     *i += 1;
-    args.get(*i).cloned().ok_or_else(|| format!("missing value for {flag}"))
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("missing value for {flag}"))
 }
 
 fn parse_args() -> Result<(String, String, String, Options), String> {
@@ -59,6 +62,7 @@ fn parse_args() -> Result<(String, String, String, Options), String> {
     let mut sample_col = None;
     let mut out = "results.tsv".to_string();
     let mut threads: usize = 0;
+    let mut dump_prefix = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -72,6 +76,7 @@ fn parse_args() -> Result<(String, String, String, Options), String> {
             "--contrast-control" => control_level = Some(take(&args, &mut i)?),
             "--sample-col" => sample_col = Some(take(&args, &mut i)?),
             "--out" => out = take(&args, &mut i)?,
+            "--dump-prefix" => dump_prefix = Some(take(&args, &mut i)?),
             "--threads" => {
                 threads = take(&args, &mut i)?
                     .parse()
@@ -100,6 +105,7 @@ fn parse_args() -> Result<(String, String, String, Options), String> {
             control_level,
             sample_col,
             threads,
+            dump_prefix,
         },
     ))
 }
@@ -121,7 +127,11 @@ fn run() -> Result<(), String> {
 
     let results = deseq::run(&counts, &coldata, &opts)?;
     io::write_results(&out_path, &results)?;
-    eprintln!("[rust_deseq2] wrote {} results to {}", results.len(), out_path);
+    eprintln!(
+        "[rust_deseq2] wrote {} results to {}",
+        results.len(),
+        out_path
+    );
     Ok(())
 }
 

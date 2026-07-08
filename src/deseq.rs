@@ -11,6 +11,8 @@ use crate::glm::{estimate_dispersion, fit_nb_glm};
 use crate::io::{ColData, CountMatrix, GeneResult};
 use crate::linalg::{invert, Mat};
 use crate::mathx::{benjamini_hochberg, mad, median, norm_two_sided_p, quantile, trigamma};
+use std::fs::File;
+use std::io::{BufWriter, Write};
 
 /// Floor on the estimated dispersion-prior variance (natural-log scale),
 /// matching DESeq2's default of 0.25.
@@ -34,6 +36,8 @@ pub struct Options {
     pub sample_col: Option<String>,
     /// Worker threads for the per-gene loops; 0 = auto (cores, capped at 16).
     pub threads: usize,
+    /// Optional file prefix for intermediate parity diagnostics.
+    pub dump_prefix: Option<String>,
 }
 
 /// Map `f` over gene indices `0..g`, splitting the work across `nthreads`
@@ -75,6 +79,17 @@ struct Pass1 {
     mu: Vec<f64>,
 }
 
+/// Per-gene diagnostics from pass 2, used only by `--dump-prefix`.
+struct Pass2 {
+    result: GeneResult,
+    mu: Vec<f64>,
+    disp_fit: f64,
+    disp_map: f64,
+    dispersion: f64,
+    disp_outlier: bool,
+    beta_conv: bool,
+}
+
 /// Pass 1 for a single gene: baseMean, fitted means and the Cox-Reid gene-wise
 /// dispersion (seeded by the rough/moments initialiser).
 #[allow(clippy::too_many_arguments)]
@@ -94,7 +109,12 @@ fn pass1_gene(
     let base_mean = y_norm.iter().sum::<f64>() / m;
 
     if y.iter().sum::<f64>() <= 0.0 {
-        return Pass1 { base_mean, disp: f64::NAN, all_zero: true, mu: Vec::new() };
+        return Pass1 {
+            base_mean,
+            disp: f64::NAN,
+            all_zero: true,
+            mu: Vec::new(),
+        };
     }
     let alpha_init = init_dispersion(&y_norm, x, inv_xtx, p, base_mean, xim, MIN_DISP, max_disp);
     let mut fit = fit_nb_glm(y, x, offset, p, alpha_init, 100);
@@ -103,7 +123,12 @@ fn pass1_gene(
         fit = fit_nb_glm(y, x, offset, p, disp, 100);
         disp = estimate_dispersion(y, &fit.mu, x, p, max_disp, None);
     }
-    Pass1 { base_mean, disp, all_zero: false, mu: fit.mu }
+    Pass1 {
+        base_mean,
+        disp,
+        all_zero: false,
+        mu: fit.mu,
+    }
 }
 
 /// Pass 2 for a single gene: MAP dispersion (with outlier carve-out) and the
@@ -124,24 +149,32 @@ fn pass2_gene(
     p: usize,
     case_col: usize,
     max_disp: f64,
-) -> GeneResult {
+) -> Pass2 {
     if all_zero {
-        return GeneResult {
-            gene,
-            base_mean: 0.0,
-            log2_fold_change: f64::NAN,
-            lfc_se: f64::NAN,
-            stat: f64::NAN,
-            pvalue: f64::NAN,
-            padj: f64::NAN,
+        return Pass2 {
+            result: GeneResult {
+                gene,
+                base_mean: 0.0,
+                log2_fold_change: f64::NAN,
+                lfc_se: f64::NAN,
+                stat: f64::NAN,
+                pvalue: f64::NAN,
+                padj: f64::NAN,
+            },
+            mu: Vec::new(),
+            disp_fit: trend,
+            disp_map: f64::NAN,
+            dispersion: f64::NAN,
+            disp_outlier: false,
+            beta_conv: false,
         };
     }
     // MAP (shrunken) dispersion; gene-wise estimates > 2 raw residual SDs above
     // the trend are left unshrunk (DESeq2 dispersion-outlier rule).
     let map_disp = estimate_dispersion(y, mu_init, x, p, max_disp, Some((trend, prior_var)));
-    let final_disp = if genewise_disp.is_finite()
-        && genewise_disp.ln() - trend.ln() > 2.0 * disp_outlier_sd
-    {
+    let disp_outlier =
+        genewise_disp.is_finite() && genewise_disp.ln() - trend.ln() > 2.0 * disp_outlier_sd;
+    let final_disp = if disp_outlier {
         genewise_disp
     } else {
         map_disp
@@ -157,14 +190,244 @@ fn pass2_gene(
     } else {
         (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     };
-    GeneResult {
-        gene,
-        base_mean,
-        log2_fold_change: lfc2,
-        lfc_se: lfcse2,
-        stat,
-        pvalue: pval,
-        padj: f64::NAN,
+    Pass2 {
+        result: GeneResult {
+            gene,
+            base_mean,
+            log2_fold_change: lfc2,
+            lfc_se: lfcse2,
+            stat,
+            pvalue: pval,
+            padj: f64::NAN,
+        },
+        mu: fit.mu,
+        disp_fit: trend,
+        disp_map: map_disp,
+        dispersion: final_disp,
+        disp_outlier,
+        beta_conv: fit.converged,
+    }
+}
+
+fn fmt_num(x: f64) -> String {
+    if x.is_finite() {
+        format!("{:.17e}", x)
+    } else {
+        "NA".to_string()
+    }
+}
+
+fn write_diagnostics(
+    prefix: &str,
+    counts: &CountMatrix,
+    sf: &[f64],
+    base_means: &[f64],
+    genewise_disp: &[f64],
+    pass2: &[Pass2],
+) -> Result<(), String> {
+    let sf_path = format!("{prefix}.size_factors.tsv");
+    let mut sfw = BufWriter::new(
+        File::create(&sf_path).map_err(|e| format!("cannot write '{sf_path}': {e}"))?,
+    );
+    writeln!(sfw, "sample\tsizeFactor").map_err(|e| e.to_string())?;
+    for (sample, size_factor) in counts.samples.iter().zip(sf) {
+        writeln!(sfw, "{}\t{}", sample, fmt_num(*size_factor)).map_err(|e| e.to_string())?;
+    }
+
+    let gene_path = format!("{prefix}.genes.tsv");
+    let mut gw = BufWriter::new(
+        File::create(&gene_path).map_err(|e| format!("cannot write '{gene_path}': {e}"))?,
+    );
+    writeln!(
+        gw,
+        "gene\tbaseMean\tdispGeneEst\tdispFit\tdispMAP\tdispersion\tdispOutlier\tbetaConv\tlog2FoldChange\tlfcSE\tstat\tpvalue\tpadj"
+    )
+    .map_err(|e| e.to_string())?;
+    for gi in 0..counts.n_genes() {
+        let p2 = &pass2[gi];
+        let r = &p2.result;
+        writeln!(
+            gw,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.gene,
+            fmt_num(base_means[gi]),
+            fmt_num(genewise_disp[gi]),
+            fmt_num(p2.disp_fit),
+            fmt_num(p2.disp_map),
+            fmt_num(p2.dispersion),
+            p2.disp_outlier,
+            p2.beta_conv,
+            fmt_num(r.log2_fold_change),
+            fmt_num(r.lfc_se),
+            fmt_num(r.stat),
+            fmt_num(r.pvalue),
+            fmt_num(r.padj)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn trimmed_mean(values: &[f64], trim: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let cut = (v.len() as f64 * trim).floor() as usize;
+    let lo = cut.min(v.len());
+    let hi = v.len().saturating_sub(cut);
+    if lo >= hi {
+        return v.iter().sum::<f64>() / v.len() as f64;
+    }
+    v[lo..hi].iter().sum::<f64>() / (hi - lo) as f64
+}
+
+fn trim_rule(n: usize) -> (f64, f64) {
+    if n <= 3 {
+        (1.0 / 3.0, 2.04)
+    } else if n <= 23 {
+        (1.0 / 4.0, 1.86)
+    } else {
+        (1.0 / 8.0, 1.51)
+    }
+}
+
+fn hat_diagonal(x: &[f64], mu: &[f64], dispersion: f64, p: usize) -> Option<Vec<f64>> {
+    let n = mu.len();
+    let mut xtwx = Mat::zeros(p, p);
+    let mut w = vec![0.0; n];
+    for i in 0..n {
+        w[i] = mu[i] / (1.0 + dispersion * mu[i]);
+        for a in 0..p {
+            let xa = x[i * p + a];
+            for b in a..p {
+                xtwx.add(a, b, w[i] * xa * x[i * p + b]);
+            }
+        }
+    }
+    for a in 0..p {
+        for b in (a + 1)..p {
+            let v = xtwx.get(a, b);
+            xtwx.set(b, a, v);
+        }
+    }
+    let inv = invert(&xtwx)?;
+    let mut h = vec![0.0; n];
+    for i in 0..n {
+        let mut q = 0.0;
+        for a in 0..p {
+            for b in 0..p {
+                q += x[i * p + a] * inv.get(a, b) * x[i * p + b];
+            }
+        }
+        h[i] = w[i] * q;
+    }
+    Some(h)
+}
+
+fn cooks_cutoff_99(p: usize, residual_df: usize) -> Option<f64> {
+    // The supported CLI design has two coefficients. For F(2, v),
+    // CDF(x) = 1 - (v / (v + 2x))^(v/2), so the 0.99 quantile is analytic.
+    if p != 2 || residual_df == 0 {
+        return None;
+    }
+    let v = residual_df as f64;
+    Some(v * (0.01_f64.powf(-2.0 / v) - 1.0) / 2.0)
+}
+
+fn replace_cooks_outliers(
+    counts: &CountMatrix,
+    sf: &[f64],
+    x: &[f64],
+    p: usize,
+    levels_per_sample: &[String],
+    pass2: &[Pass2],
+) -> Option<CountMatrix> {
+    let n = counts.n_samples();
+    let g = counts.n_genes();
+    let cutoff = cooks_cutoff_99(p, n.checked_sub(p)?)?;
+
+    let mut group_sizes = std::collections::HashMap::<&str, usize>::new();
+    for level in levels_per_sample {
+        *group_sizes.entry(level.as_str()).or_insert(0) += 1;
+    }
+    let replaceable: Vec<bool> = levels_per_sample
+        .iter()
+        .map(|level| group_sizes.get(level.as_str()).copied().unwrap_or(0) >= 7)
+        .collect();
+    if !replaceable.iter().any(|&x| x) {
+        return None;
+    }
+
+    let mut replaced = counts.clone();
+    let mut changed = false;
+    for (gi, p2) in pass2.iter().enumerate().take(g) {
+        let row = counts.row(gi);
+        if p2.mu.is_empty() || !p2.dispersion.is_finite() {
+            continue;
+        }
+
+        let norm: Vec<f64> = (0..n).map(|i| row[i] / sf[i]).collect();
+        let base_mean = norm.iter().sum::<f64>() / n as f64;
+        if base_mean <= 0.0 {
+            continue;
+        }
+
+        // DESeq2 robustMethodOfMomentsDisp for designs with >=3 samples per cell.
+        let mut cell_vars = Vec::new();
+        for level in group_sizes.keys() {
+            let idx: Vec<usize> = levels_per_sample
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| if v == level { Some(i) } else { None })
+                .collect();
+            if idx.len() < 3 {
+                continue;
+            }
+            let (trim, scale) = trim_rule(idx.len());
+            let vals: Vec<f64> = idx.iter().map(|&i| norm[i]).collect();
+            let cell_mean = trimmed_mean(&vals, trim);
+            let sqerr: Vec<f64> = idx.iter().map(|&i| (norm[i] - cell_mean).powi(2)).collect();
+            cell_vars.push(scale * trimmed_mean(&sqerr, trim));
+        }
+        if cell_vars.is_empty() {
+            continue;
+        }
+        let robust_var = cell_vars.into_iter().fold(0.0_f64, f64::max);
+        let robust_disp = ((robust_var - base_mean) / (base_mean * base_mean)).max(0.04);
+
+        let h = match hat_diagonal(x, &p2.mu, p2.dispersion, p) {
+            Some(v) => v,
+            None => continue,
+        };
+        let trim_base_mean = trimmed_mean(&norm, 0.2);
+        for i in 0..n {
+            if !replaceable[i] {
+                continue;
+            }
+            let v = p2.mu[i] + robust_disp * p2.mu[i] * p2.mu[i];
+            let denom = (1.0 - h[i]).powi(2);
+            if v <= 0.0 || denom <= 0.0 {
+                continue;
+            }
+            let pearson_sq = (row[i] - p2.mu[i]).powi(2) / v;
+            let cooks = pearson_sq / p as f64 * h[i] / denom;
+            if cooks > cutoff {
+                let new_count = (trim_base_mean * sf[i]).trunc();
+                let pos = gi * n + i;
+                if (replaced.counts[pos] - new_count).abs() > 0.0 {
+                    replaced.counts[pos] = new_count;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        Some(replaced)
+    } else {
+        None
     }
 }
 
@@ -174,7 +437,7 @@ fn size_factors(counts: &CountMatrix) -> Vec<f64> {
     let n = counts.n_samples();
     // Per-gene log geometric mean, using only genes with all-positive counts.
     let mut loggeom = vec![f64::NEG_INFINITY; g];
-    for gi in 0..g {
+    for (gi, loggeom_i) in loggeom.iter_mut().enumerate() {
         let row = counts.row(gi);
         let mut sum_log = 0.0;
         let mut ok = true;
@@ -186,22 +449,26 @@ fn size_factors(counts: &CountMatrix) -> Vec<f64> {
             sum_log += c.ln();
         }
         if ok {
-            loggeom[gi] = sum_log / n as f64;
+            *loggeom_i = sum_log / n as f64;
         }
     }
 
     let mut sf = vec![1.0; n];
-    for s in 0..n {
+    for (s, sf_s) in sf.iter_mut().enumerate() {
         let mut ratios = Vec::with_capacity(g);
-        for gi in 0..g {
-            if loggeom[gi].is_finite() {
+        for (gi, &loggeom_i) in loggeom.iter().enumerate() {
+            if loggeom_i.is_finite() {
                 let c = counts.counts[gi * n + s];
                 if c > 0.0 {
-                    ratios.push(c.ln() - loggeom[gi]);
+                    ratios.push(c.ln() - loggeom_i);
                 }
             }
         }
-        sf[s] = if ratios.is_empty() { 1.0 } else { median(&ratios).exp() };
+        *sf_s = if ratios.is_empty() {
+            1.0
+        } else {
+            median(&ratios).exp()
+        };
     }
     sf
 }
@@ -222,7 +489,9 @@ fn build_design(
         }
     }
     if !uniq.iter().any(|l| l == control) {
-        return Err(format!("control level '{control}' not present in design column"));
+        return Err(format!(
+            "control level '{control}' not present in design column"
+        ));
     }
     if !uniq.iter().any(|l| l == case) {
         return Err(format!("case level '{case}' not present in design column"));
@@ -231,15 +500,19 @@ fn build_design(
         return Err("case and control levels must differ".into());
     }
     // Order: control (reference) first, then the remaining levels sorted.
-    let mut rest: Vec<String> = uniq.iter().filter(|l| l.as_str() != control).cloned().collect();
+    let mut rest: Vec<String> = uniq
+        .iter()
+        .filter(|l| l.as_str() != control)
+        .cloned()
+        .collect();
     rest.sort();
     let mut order = vec![control.to_string()];
     order.extend(rest);
 
     let n = levels_per_sample.len();
     let p = order.len(); // intercept + (n_levels - 1) dummies
-    // Coefficient index for a level: reference -> intercept only (no own col);
-    // non-reference level k (1-based in `order`) -> column k.
+                         // Coefficient index for a level: reference -> intercept only (no own col);
+                         // non-reference level k (1-based in `order`) -> column k.
     let mut level_col = std::collections::HashMap::new();
     for (k, lv) in order.iter().enumerate() {
         level_col.insert(lv.clone(), k); // k==0 is the reference (intercept)
@@ -267,6 +540,7 @@ fn build_design(
 ///
 /// `min(rough, moments)` is then bounded to `[minDisp, maxDisp]`. A better start
 /// makes the optimizer land on DESeq2's estimate for hard/high-dispersion genes.
+#[allow(clippy::too_many_arguments)]
 fn init_dispersion(
     y_norm: &[f64],
     x: &[f64],
@@ -288,12 +562,12 @@ fn init_dispersion(
         }
     }
     let mut beta = vec![0.0; p];
-    for j in 0..p {
+    for (j, beta_j) in beta.iter_mut().enumerate().take(p) {
         let mut s = 0.0;
-        for k in 0..p {
-            s += inv_xtx.get(j, k) * xty[k];
+        for (k, &xty_k) in xty.iter().enumerate().take(p) {
+            s += inv_xtx.get(j, k) * xty_k;
         }
-        beta[j] = s;
+        *beta_j = s;
     }
 
     // rough dispersion from the linear-model residuals (mu floored at 1).
@@ -421,6 +695,16 @@ pub fn run(
     coldata: &ColData,
     opts: &Options,
 ) -> Result<Vec<GeneResult>, String> {
+    run_inner(counts, coldata, opts, None, true)
+}
+
+fn run_inner(
+    counts: &CountMatrix,
+    coldata: &ColData,
+    opts: &Options,
+    fixed_size_factors: Option<&[f64]>,
+    allow_outlier_replacement: bool,
+) -> Result<Vec<GeneResult>, String> {
     let n = counts.n_samples();
 
     // --- align samples: count-matrix column order is authoritative ---
@@ -447,11 +731,12 @@ pub fn run(
         );
     }
 
-    let (x, p, case_col) =
-        build_design(&levels_per_sample, &opts.control_level, &opts.case_level)?;
+    let (x, p, case_col) = build_design(&levels_per_sample, &opts.control_level, &opts.case_level)?;
 
     // --- size factors and offsets ---
-    let sf = size_factors(counts);
+    let sf = fixed_size_factors
+        .map(|v| v.to_vec())
+        .unwrap_or_else(|| size_factors(counts));
     let offset: Vec<f64> = sf.iter().map(|s| s.ln()).collect();
 
     let g = counts.n_genes();
@@ -509,11 +794,19 @@ pub fn run(
     }
     let var_log_disp = if resid.len() >= 3 {
         let s = mad(&resid);
-        if s.is_finite() { s * s } else { 0.0 }
+        if s.is_finite() {
+            s * s
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
-    let exp_var = if m - pf > 0.0 { trigamma((m - pf) / 2.0) } else { 1.0 };
+    let exp_var = if m - pf > 0.0 {
+        trigamma((m - pf) / 2.0)
+    } else {
+        1.0
+    };
     let prior_var = (var_log_disp - exp_var).max(DISP_PRIOR_VAR_FLOOR);
     // Dispersion-outlier cutoff uses the *raw* spread of the log-dispersion
     // estimates (varLogDispEsts), before subtracting the expected sampling
@@ -526,7 +819,7 @@ pub fn run(
     };
 
     // --- pass 2 (parallel): MAP dispersion + NB GLM Wald test ---
-    let mut results = parallel_map(g, nthreads, |gi| {
+    let mut pass2 = parallel_map(g, nthreads, |gi| {
         pass2_gene(
             counts.genes[gi].clone(),
             counts.row(gi),
@@ -545,11 +838,38 @@ pub fn run(
         )
     });
 
+    if allow_outlier_replacement {
+        if let Some(replaced_counts) =
+            replace_cooks_outliers(counts, &sf, &x, p, &levels_per_sample, &pass2)
+        {
+            eprintln!("[rust_deseq2] Cook's outlier counts replaced; refitting");
+            return run_inner(&replaced_counts, coldata, opts, Some(&sf), false);
+        }
+    }
+
+    let mut results: Vec<GeneResult> = pass2
+        .iter()
+        .map(|p2| GeneResult {
+            gene: p2.result.gene.clone(),
+            base_mean: p2.result.base_mean,
+            log2_fold_change: p2.result.log2_fold_change,
+            lfc_se: p2.result.lfc_se,
+            stat: p2.result.stat,
+            pvalue: p2.result.pvalue,
+            padj: p2.result.padj,
+        })
+        .collect();
+
     // --- BH adjustment with independent filtering on baseMean ---
     let pvals: Vec<f64> = results.iter().map(|r| r.pvalue).collect();
     let padj = independent_filter(&base_means, &pvals, FILTER_ALPHA);
     for gi in 0..g {
         results[gi].padj = padj[gi];
+        pass2[gi].result.padj = padj[gi];
+    }
+
+    if let Some(prefix) = &opts.dump_prefix {
+        write_diagnostics(prefix, counts, &sf, &base_means, &genewise_disp, &pass2)?;
     }
 
     Ok(results)
@@ -651,14 +971,21 @@ fn lowess(x: &[f64], y: &[f64], f: f64, iter: usize) -> Vec<f64> {
             // r nearest neighbours of x[i] (indices), by absolute distance.
             let mut idx: Vec<usize> = (0..n).collect();
             idx.sort_by(|&a, &b| {
-                (x[a] - x[i]).abs().partial_cmp(&(x[b] - x[i]).abs()).unwrap()
+                (x[a] - x[i])
+                    .abs()
+                    .partial_cmp(&(x[b] - x[i]).abs())
+                    .unwrap()
             });
             let nb = &idx[0..r];
             let h = nb.iter().map(|&j| (x[j] - x[i]).abs()).fold(0.0, f64::max);
 
             let (mut sw, mut swx, mut swy, mut swxx, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
             for &j in nb {
-                let d = if h > 0.0 { (x[j] - x[i]).abs() / h } else { 0.0 };
+                let d = if h > 0.0 {
+                    (x[j] - x[i]).abs() / h
+                } else {
+                    0.0
+                };
                 let tri = if d < 1.0 {
                     let t = 1.0 - d * d * d;
                     t * t * t

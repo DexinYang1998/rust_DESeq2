@@ -35,11 +35,15 @@ The pipeline mirrors the essential steps of DESeq2:
    (`minmu = 0.5`), which keep separated / all-zero-in-a-group genes finite and
    bounded. The coefficient covariance is the **ridge sandwich**
    `(XᵀWX+λ)⁻¹ · XᵀWX · (XᵀWX+λ)⁻¹`, not the plain ridged inverse.
-5. A **Wald test** on the case-vs-control contrast, giving `log2FoldChange`,
+5. DESeq2-style **Cook's-distance outlier replacement** for sufficiently
+   replicated cells (`minReplicatesForReplace = 7`): the first fit computes
+   Cook's distances, replaces flagged counts with trimmed-mean replacement
+   counts, keeps the original size factors, and refits before reporting.
+6. A **Wald test** on the case-vs-control contrast, giving `log2FoldChange`,
    `lfcSE`, `stat`, `pvalue`. Tail probabilities use an **`erfc`-based** normal
    survival function (relative accuracy ~1e-7), so extreme statistics yield
    correct tiny p-values instead of underflowing to 0.
-6. **Benjamini–Hochberg** adjusted p-values (`padj`) with **independent
+7. **Benjamini–Hochberg** adjusted p-values (`padj`) with **independent
    filtering** on `baseMean`, reproducing DESeq2's procedure: 50 quantile
    thresholds, a **LOWESS (f = 1/5)** smooth of the rejection-count curve, the
    smallest threshold within one residual SD of the smoothed peak, and filtering
@@ -52,10 +56,10 @@ Output columns match DESeq2's `results()` table:
 
 This is a faithful *core* reimplementation, not a drop-in replacement. It
 implements size factors, Cox–Reid dispersion with a fitted trend + estimated
-prior + MAP shrinkage, the NB-GLM Wald test, and independent filtering. It still
-omits a few of DESeq2's refinements: Cook's-distance **outlier replacement**, the
-exact `parametricDispersionFit` gamma-GLM trend (a least-squares fit is used
-instead), and `apeglm`/`ashr` LFC shrinkage. Estimates track DESeq2 to 3–4
+prior + MAP shrinkage, Cook's outlier replacement, the NB-GLM Wald test, and
+independent filtering. It still omits a few of DESeq2's refinements:
+model-matrix forms beyond a single two-level condition and `apeglm`/`ashr` LFC
+shrinkage. Estimates track DESeq2 to 3–4
 significant figures on any adequately expressed gene (see validation); the only
 material divergence is in near-zero-count genes, where fold-change estimation is
 inherently unstable for both tools.
@@ -86,6 +90,8 @@ cargo build --release
   aligned to the count matrix by id.
 - **`--threads`**: worker threads for the per-gene fits (default: cores, capped
   at 16). See [Performance](#performance).
+- **`--dump-prefix`**: optional diagnostic prefix for parity debugging; writes
+  `<prefix>.size_factors.tsv` and `<prefix>.genes.tsv`.
 
 ## R wrapper
 
@@ -104,13 +110,10 @@ head(res[order(res$padj), ])
 The wrapper calls the binary with `system2()` and reads the output back with
 `read.delim()`, returning a `data.frame`.
 
-> **Binary path.** The wrapper's default `binary=` is
-> `/data/dyang11/software/rust_deseq2/target/release/rust_deseq2`. This project
-> lives at `.../rewrite_package/rust_deseq2`, so either build there and point to
-> that path, or pass `binary=` explicitly, e.g.
-> `binary = normalizePath("target/release/rust_deseq2")`. To make the default
-> work as-is you can symlink:
-> `ln -s /data/dyang11/software/rewrite_package/rust_deseq2 /data/dyang11/software/rust_deseq2`.
+> **Binary path.** The wrapper's default `binary=` is the `RUST_DESEQ2_BIN`
+> environment variable, falling back to `target/release/rust_deseq2` relative to
+> the current working directory. Build with `cargo build --release`, or pass
+> `binary = normalizePath("target/release/rust_deseq2")` explicitly.
 
 ## Validation
 
@@ -155,35 +158,32 @@ runs in ~7 s single-threaded):
 | quantity | agreement with DESeq2 |
 |----------|-----------------------|
 | `baseMean` | r = 1.000 |
-| `log2FoldChange`, all 19.9k genes | r = 0.985 |
-| `log2FoldChange`, `baseMean > 5` (16.9k genes) | r = 0.9999, RMSE ≈ 0.009 |
-| `stat` (Wald) | **r = 0.9997**, Spearman = 0.996 |
+| `log2FoldChange`, all 19.9k genes | r = 1.000, RMSE ≈ 0.0018 |
+| `log2FoldChange`, `baseMean > 5` (16.9k genes) | r = 1.000, RMSE ≈ 0.001 |
+| `stat` (Wald) | **r = 1.000**, Spearman = 1.000 |
 | `-log10(pvalue)` | **r = 0.9999** |
-| `lfcSE` (all genes) | r = 0.9945 |
-| `lfcSE`, `baseMean > 5` | r = 0.9999 |
+| `lfcSE` (all genes) | r = 0.9997 |
+| `lfcSE`, `baseMean > 5` | r = 1.000 |
 | `pvalue = NA` count | 71 (identical to DESeq2) |
-| LFC vs known truth | DESeq2 r = 0.7701 · rust r = 0.7699 |
+| LFC vs known truth | DESeq2 r = 0.7703 · rust r = 0.7703 |
 
-DE calls at `padj < 0.05` agree on **99.97 %** of genes (Jaccard 0.997; 2 FP,
-4 FN out of ~2096). The Gamma-GLM dispersion trend keeps the low-mean
-extrapolation in line with DESeq2 (Wald-statistic r = 0.9997); the `erfc` tail
-lifts `-log10(pvalue)` agreement from ~0.7 to 0.9999; the rough/moments
-dispersion initialiser with the `maxDisp = max(10, n)` cap plus the ridge
-sandwich covariance and `minmu` floor bring `lfcSE` agreement to 0.994 (0.9999
-for `baseMean > 5`). The only residual `lfcSE` differences are a handful of
-genes with `baseMean ≈ 0` that DESeq2 emits as exactly `0`.
+DE calls at `padj < 0.05` agree on **99.95 %** of genes (Jaccard 0.995; 7
+rust-only, 3 DESeq2-only out of ~2100). Cook's replacement is the main change:
+it makes size factors/baseMean match DESeq2 exactly and reduces large-set LFC
+RMSE from ~0.15 to ~0.0018. Remaining differences are mostly around the
+dispersion trend/MAP estimate and a few genes at the adjusted-p-value boundary.
 
 **Unbalanced set — 15,000 genes, 4 vs 12 samples** (`examples/make_example_4v12.R`),
 stressing the small-group regime:
 
 | quantity | agreement with DESeq2 |
 |----------|-----------------------|
-| `log2FoldChange` | r = 0.996 |
-| `lfcSE` | r = 0.998 |
-| `stat` (Wald) | r = 0.9998 |
+| `log2FoldChange` | r = 1.000, RMSE ≈ 0.0015 |
+| `lfcSE` | r = 0.9997 |
+| `stat` (Wald) | r = 0.9999 |
 | `-log10(pvalue)` | r = 0.9997 |
-| DE calls @ padj<0.05 | Jaccard 0.994 |
-| LFC vs known truth | DESeq2 r = 0.7333 · rust r = 0.7334 |
+| DE calls @ padj<0.05 | Jaccard 0.991 |
+| LFC vs known truth | DESeq2 r = 0.7336 · rust r = 0.7336 |
 
 Reproduce with:
 
@@ -200,22 +200,30 @@ parallel and run across `--threads` scoped worker threads (pure `std`, no
 dependencies). Wall-clock, best of 3, vs. single-threaded Bioconductor DESeq2
 (`DESeq()` + `results()`), on one machine; rust timings include TSV read/write:
 
-| dataset | DESeq2 | rust (16 thr) | speedup |
+| dataset | DESeq2 | rust (auto) | speedup |
 |---------|--------|---------------|---------|
-| 400 × 12    | 0.87 s | 0.01 s | ~67× |
-| 15k × 16 (4v12) | 4.70 s | 0.42 s | ~11× |
-| 20k × 16    | 6.01 s | 0.56 s | ~11× |
+| 400 × 12    | 1.07 s | 0.06 s | ~18× |
+| 15k × 16 (4v12) | 5.21 s | 0.80 s | ~6.5× |
+| 20k × 16    | 7.05 s | 1.06 s | ~6.6× |
 
-Thread scaling on the 20k set (near-linear to ~16 threads):
+Thread scaling without Cook's replacement is near-linear to ~16 threads. With
+default DESeq2-style replacement, datasets with flagged outliers perform two
+full fits, so the runtime is roughly doubled on those inputs:
 
-| threads | 1 | 4 | 8 | 16 | 32 |
-|---------|-----|-----|-----|-----|-----|
-| time (s)| 7.4 | 1.9 | 1.0 | 0.55 | 0.38 |
+| dataset | rust `--threads 1` | rust auto |
+|---------|--------------------|-----------|
+| 400 × 12 | 0.14 s | 0.06 s |
+| 20k × 16 | 14.81 s | 1.06 s |
+| 15k × 16 (4v12) | 11.04 s | 0.80 s |
 
-Note that single-threaded (`--threads 1`) rust is ~on par with DESeq2's
-optimised C++/Armadillo (7.4 s vs 6 s); the speedup comes from parallelism, since
-`DESeq()` is single-threaded by default. Reproduce with
-`examples/benchmark_time.R`.
+Single-threaded Rust is slower than DESeq2 on replacement-heavy datasets because
+it performs the extra refit in pure Rust; the wall-clock speedup comes from
+parallel per-gene fitting. Reproduce with:
+
+```bash
+cargo build --release
+/opt/R/4.3.3/bin/Rscript examples/benchmark_time.R 3
+```
 
 ## Layout
 
@@ -236,6 +244,7 @@ rust_deseq2/
     ├── make_example_large.R  # 20k-gene dataset, varying depth
     ├── make_example_4v12.R   # 15k-gene unbalanced dataset (4 vs 12)
     ├── compare_deseq2.R      # head-to-head vs Bioconductor DESeq2
+    ├── parity_deseq2.R       # stage-level DESeq2 internal parity check
     └── benchmark_time.R      # wall-clock timing vs DESeq2
 ```
 
@@ -251,6 +260,5 @@ rust_deseq2/
   prior** (`λ = 1e-6/ln2²`) and the fitted-mean floor (**`minmu = 0.5`**), both
   DESeq2 defaults — which raised the low-count fold-change agreement and matched
   DESeq2's set of untested genes exactly. This implementation is independent and
-  dependency-free (that project uses `ndarray` and adds Cook's-distance
-  outliers, apeglm/ashr shrinkage, LRT, VST/rlog and multi-factor designs, which
-  are out of scope here).
+  dependency-free (that project uses `ndarray` and adds apeglm/ashr shrinkage,
+  LRT, VST/rlog and multi-factor designs, which are out of scope here).

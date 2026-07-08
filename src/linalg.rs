@@ -12,7 +12,11 @@ pub struct Mat {
 
 impl Mat {
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Mat { rows, cols, data: vec![0.0; rows * cols] }
+        Mat {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
     }
 
     #[inline]

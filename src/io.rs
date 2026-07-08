@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 /// A gene-by-sample count matrix.
+#[derive(Clone)]
 pub struct CountMatrix {
     pub genes: Vec<String>,
     pub samples: Vec<String>,
@@ -71,7 +72,11 @@ pub fn read_counts(path: &str) -> Result<CountMatrix, String> {
             counts.push(v);
         }
     }
-    Ok(CountMatrix { genes, samples, counts })
+    Ok(CountMatrix {
+        genes,
+        samples,
+        counts,
+    })
 }
 
 /// Sample metadata: a header row of column names and one row per sample. The
@@ -127,7 +132,11 @@ pub fn read_coldata(path: &str) -> Result<ColData, String> {
             values[c].push(cell.to_string());
         }
     }
-    Ok(ColData { columns, sample_ids, values })
+    Ok(ColData {
+        columns,
+        sample_ids,
+        values,
+    })
 }
 
 /// A single gene's differential-expression result.
@@ -161,8 +170,11 @@ fn fmt(x: f64) -> String {
 pub fn write_results(path: &str, results: &[GeneResult]) -> Result<(), String> {
     let f = File::create(path).map_err(|e| format!("cannot write '{path}': {e}"))?;
     let mut w = BufWriter::new(f);
-    writeln!(w, "gene\tbaseMean\tlog2FoldChange\tlfcSE\tstat\tpvalue\tpadj")
-        .map_err(|e| e.to_string())?;
+    writeln!(
+        w,
+        "gene\tbaseMean\tlog2FoldChange\tlfcSE\tstat\tpvalue\tpadj"
+    )
+    .map_err(|e| e.to_string())?;
     for r in results {
         writeln!(
             w,

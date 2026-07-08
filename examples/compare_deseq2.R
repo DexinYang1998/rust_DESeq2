@@ -2,7 +2,9 @@
 # Head-to-head: rust_deseq2 vs. real DESeq2 on the same example dataset.
 suppressMessages(library(DESeq2))
 
-proj <- "/data/dyang11/software/rewrite_package/rust_deseq2"
+script_file <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE)[1])
+script_dir <- if (!is.na(script_file)) dirname(normalizePath(script_file)) else getwd()
+proj <- normalizePath(file.path(script_dir, ".."))
 argv <- commandArgs(trailingOnly = TRUE)
 counts_f <- if (length(argv) >= 1) argv[1] else file.path(proj, "examples/gene_counts.tsv")
 meta_f   <- if (length(argv) >= 2) argv[2] else file.path(proj, "examples/sample_metadata.tsv")

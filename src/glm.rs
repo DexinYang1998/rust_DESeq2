@@ -145,17 +145,24 @@ pub fn fit_nb_glm(
         }
         let inv = match invert(&xtwx) {
             Some(m) => m,
-            None => return GlmFit { beta, cov: Mat::zeros(p, p), mu, converged: false },
+            None => {
+                return GlmFit {
+                    beta,
+                    cov: Mat::zeros(p, p),
+                    mu,
+                    converged: false,
+                }
+            }
         };
 
         // Penalised (ridge) IRLS update: beta = (X'WX + ridge)^-1 X'Wu.
         let mut new_beta = vec![0.0; p];
-        for a in 0..p {
+        for (a, new_beta_a) in new_beta.iter_mut().enumerate().take(p) {
             let mut s = 0.0;
-            for b in 0..p {
-                s += inv.get(a, b) * xtwu[b];
+            for (b, &xtwu_b) in xtwu.iter().enumerate().take(p) {
+                s += inv.get(a, b) * xtwu_b;
             }
-            new_beta[a] = s;
+            *new_beta_a = s;
         }
         // Divergence guard (DESeq2's `large`): leave beta and stop as unconverged.
         if new_beta.iter().any(|b| b.abs() > LARGE || !b.is_finite()) {
@@ -206,7 +213,12 @@ pub fn fit_nb_glm(
         None => Mat::zeros(p, p),
     };
 
-    GlmFit { beta, cov, mu, converged }
+    GlmFit {
+        beta,
+        cov,
+        mu,
+        converged,
+    }
 }
 
 /// Log-determinant of the Cox-Reid adjustment matrix `X' W X`, where

@@ -17,7 +17,9 @@
 #'   `c(condition_column, case_level, control_level)`. The log2 fold change is
 #'   reported for `case_level` relative to `control_level`.
 #' @param out Path for the output TSV. Defaults to a temporary file.
-#' @param binary Path to the compiled `rust_deseq2` binary.
+#' @param binary Path to the compiled `rust_deseq2` binary. Defaults to the
+#'   `RUST_DESEQ2_BIN` environment variable, falling back to
+#'   `target/release/rust_deseq2` relative to the current working directory.
 #'
 #' @return A data.frame with columns `gene`, `baseMean`, `log2FoldChange`,
 #'   `lfcSE`, `stat`, `pvalue`, `padj`.
@@ -40,7 +42,7 @@ rustDESeq2 <- function(
     design,
     contrast,
     out = tempfile(fileext = ".tsv"),
-    binary = "/data/dyang11/software/rust_deseq2/target/release/rust_deseq2"
+    binary = Sys.getenv("RUST_DESEQ2_BIN", "target/release/rust_deseq2")
 ) {
   ## ---- validate inputs -----------------------------------------------------
   if (!file.exists(countData)) {
