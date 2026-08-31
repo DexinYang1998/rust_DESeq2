@@ -1,264 +1,219 @@
 # rust_deseq2
 
-A from-scratch **Rust reimplementation of the core DESeq2 differential-expression
-workflow**, plus a thin R wrapper (`R/rustDESeq2.R`) that drives the compiled
-CLI and returns a `data.frame`.
+A from-scratch **Rust reimplementation of the DESeq2 differential-expression
+workflow** (`DESeq()` + `results()`, Wald test), engineered to reproduce
+Bioconductor DESeq2 numerically — not just the same method, but the same
+algorithms, the same iteration paths, and the same edge-case rules — with
+support for **multi-factor designs with covariates**
+(`~ batch + age + condition`).
 
-The crate is intentionally **dependency-free** — all numerics (GLM/IRLS, linear
-algebra, special functions, statistics) are implemented in pure `std` Rust, so
-it builds offline with no external footprint.
+The crate is dependency-free (pure `std` Rust); a thin R wrapper
+(`R/rustDESeq2.R`) drives the CLI and returns a `data.frame`.
 
 ## What it implements
 
-The pipeline mirrors the essential steps of DESeq2:
+Each stage is a faithful port of the corresponding DESeq2 1.42.x code path
+(R/C++ sources cited in the module docs):
 
-1. **Median-of-ratios size factors** (`estimateSizeFactors`) from genes with
-   all-positive counts.
-2. A **design matrix** from the condition factor, with the *control* level as
-   the reference so the *case* coefficient is directly the log fold change.
-3. **Cox–Reid adjusted gene-wise dispersion** by negative-binomial maximum
-   likelihood — seeded by DESeq2's **rough + moments initialiser**
-   (`min(roughDispEstimate, momentsDispEstimate)`) and bounded to
-   `[minDisp, maxDisp]` with `maxDisp = max(10, n)` — a parametric
-   **mean–dispersion trend** (`disp = a0 + a1/mean`) fit by DESeq2's
-   **iteratively reweighted Gamma GLM** (identity link, residual gating), an
-   **estimated log-normal prior variance** (robust MAD spread minus the expected
-   sampling variance, `trigamma((m − p)/2)`), and **MAP shrinkage**
-   of each gene's dispersion toward the trend — with a **dispersion-outlier
-   carve-out** (gene-wise estimates > 2 raw-residual SDs, `sqrt(varLogDispEsts)`,
-   above the trend are left unshrunk).
-4. A **negative-binomial GLM** (log link) fit per gene by iteratively reweighted
-   least squares (IRLS), converged on **relative deviance change**
-   (`|dev − dev_old|/(|dev|+0.1) < 1e-8`, DESeq2's criterion) with a `|β| > 30`
-   divergence guard. DESeq2's numerical stabilisers are included: a weak **ridge
-   prior** (`λ = 1e-6/ln2²`) on the coefficients and a **fitted-mean floor**
-   (`minmu = 0.5`), which keep separated / all-zero-in-a-group genes finite and
-   bounded. The coefficient covariance is the **ridge sandwich**
-   `(XᵀWX+λ)⁻¹ · XᵀWX · (XᵀWX+λ)⁻¹`, not the plain ridged inverse.
-5. DESeq2-style **Cook's-distance outlier replacement** for sufficiently
-   replicated cells (`minReplicatesForReplace = 7`): the first fit computes
-   Cook's distances, replaces flagged counts with trimmed-mean replacement
-   counts, keeps the original size factors, and refits before reporting.
-6. A **Wald test** on the case-vs-control contrast, giving `log2FoldChange`,
-   `lfcSE`, `stat`, `pvalue`. Tail probabilities use an **`erfc`-based** normal
-   survival function (relative accuracy ~1e-7), so extreme statistics yield
-   correct tiny p-values instead of underflowing to 0.
-7. **Benjamini–Hochberg** adjusted p-values (`padj`) with **independent
-   filtering** on `baseMean`, reproducing DESeq2's procedure: 50 quantile
-   thresholds, a **LOWESS (f = 1/5)** smooth of the rejection-count curve, the
-   smallest threshold within one residual SD of the smoothed peak, and filtering
-   disabled when the peak rejection count is ≤ 10.
+1. **Size factors** — median-of-ratios (`estimateSizeFactorsForMatrix`).
+2. **Model matrix** — additive design formulas `~ a + b + cond` with factor
+   columns (treatment coding, R's sorted level order, first level =
+   reference) and numeric covariate columns, as `model.matrix` builds them.
+   Interactions are not supported.
+3. **Gene-wise dispersions** (`estimateDispersionsGeneEst`): rough+moments
+   initial value; expected counts via the linear model (group designs) or the
+   NB GLM; a single Cox-Reid adjusted fit by DESeq2's Armijo backtracking
+   line search (`fitDisp`), with the no-increase revert, the iteration-1
+   convention, and the coarse+fine grid fallback (`fitDispGrid`).
+4. **Dispersion trend** — `parametricDispersionFit`'s iteratively re-gated
+   Gamma GLM (identity link, R `glm.fit` semantics with step-halving), and
+   the log-normal prior variance from R's `mad` (with its literal 1.4826
+   constant) minus `trigamma((m-p)/2)`, floored at 0.25.
+5. **MAP dispersions** (`estimateDispersionsMAP`) with DESeq2's start rule,
+   grid fallback and the 2-SD dispersion-outlier carve-out.
+6. **Wald GLM** — `fitBeta`'s ridge-penalised IRLS via the QR path
+   (Householder factorization of the weighted, ridge-augmented design),
+   `minmu=0.5`, the deviance convergence test computed with R's exact
+   saddle-point `dnbinom`, the sandwich covariance, hat diagonals, and —
+   for rows that do not converge — **a full port of R 4.3.3's L-BFGS-B**
+   (`optim`'s `lbfgsb.c`, including the bounds-aware `ndeps=1e-3` numerical
+   gradient and R's long-double sums), reproducing even the genes whose
+   estimates are optimizer-path dependent.
+7. **Contrasts** as `results(dds, contrast=c(var, case, control))`: direct
+   coefficient when `control` is the reference level, negated coefficient
+   when `case` is, and the numeric-contrast path `c'β / sqrt(c'Σc)`
+   otherwise; the all-zero-contrast rule (LFC=0, stat=0, p=1).
+8. **Outlier handling** — Cook's distances from the robust method-of-moments
+   dispersion (cells = distinct model-matrix rows), `qf(.99, p, m-p)` cutoff,
+   trimmed-mean **replacement** for cells with ≥ 7 replicates followed by a
+   refit of only the replaced genes against the stored trend/prior (as
+   `refitWithoutOutliers`), maxCooks **p-value flagging** for the rest,
+   including the two-level-design heuristic and the post-replacement
+   flagging rules.
+9. **Independent filtering** — the exact `results()` procedure with a port
+   of R's `lowess` (delta/robustness iterations included) and `p.adjust`'s
+   BH.
 
-Output columns match DESeq2's `results()` table:
-`gene  baseMean  log2FoldChange  lfcSE  stat  pvalue  padj`.
+Ported special functions match R bitwise or to a few ulp: `pnorm` (Cody),
+`lgamma` (nmath Chebyshev/`lgammacor`), `digamma`/`trigamma` (nmath
+`dpsifn`), `dnbinom` (saddle-point: `dbinom_raw`, `bd0`, `stirlerr`),
+`qf`, `lowess`, type-7 quantiles, BH. `cargo test` checks them against
+R-generated reference values.
 
-### Scope / simplifications
+## Numerical agreement with DESeq2
 
-This is a faithful *core* reimplementation, not a drop-in replacement. It
-implements size factors, Cox–Reid dispersion with a fitted trend + estimated
-prior + MAP shrinkage, Cook's outlier replacement, the NB-GLM Wald test, and
-independent filtering. It still omits a few of DESeq2's refinements:
-model-matrix forms beyond a single two-level condition and `apeglm`/`ashr` LFC
-shrinkage. Estimates track DESeq2 to 3–4
-significant figures on any adequately expressed gene (see validation); the only
-material divergence is in near-zero-count genes, where fold-change estimation is
-inherently unstable for both tools.
+Validated head-to-head against Bioconductor DESeq2 1.42.1 (R 4.3.3) with
+`examples/parity_check.R`, over six design/contrast configurations
+(single-factor balanced/unbalanced 400–20k genes, batch + 3-level condition,
+batch + continuous covariate + condition; contrasts against the reference
+level, against a non-reference level, and reversed):
+
+* **Identical on every dataset:** DE call sets at any threshold, padj NA
+  patterns (independent filtering + Cook's flagging), outlier replacement
+  flags, dispersion-outlier flags, size factors and baseMeans (≤ 2e-15).
+* **Median relative difference** across genes: `1e-11 – 1e-15` for every
+  reported column (LFC, lfcSE, stat, pvalue, padj) — i.e. all printed
+  digits.
+* **Worst case:** a handful of genes per dataset (≈ 0.1%) whose IRLS does
+  not converge or whose dispersion line search sits on an accept/reject
+  boundary differ by `1e-6 – 1e-3` (relative). This is the reproducibility
+  floor of DESeq2 itself: those genes' values change by the same magnitude
+  when R is run against a different BLAS (e.g. `FLEXIBLAS=NETLIB` vs
+  OpenBLAS), because they are optimizer-path dependent. rust_deseq2's
+  isolated L-BFGS-B reproduces R's `optim` on identical inputs to ≤ 1e-10
+  with a bit-identical objective.
+
+For designs with residual df ≤ 3 (e.g. 3 paired samples), DESeq2 estimates
+the dispersion prior variance with a seeded Monte-Carlo procedure; this is
+reproduced exactly via ports of R's Mersenne-Twister/`set.seed`, `qnorm`
+(AS 241), `rgamma`/`rchisq`, and a 1-D port of R's loess with
+`surface="interpolate"` (the kd-tree + Hermite interpolation), giving the
+bit-identical prior variance.
+
+Caveats (documented divergences):
+
+* If the parametric dispersion trend fails, DESeq2 switches to a local
+  (locfit) fit, which is not implemented — a flat median trend is used and
+  a warning printed.
+* Uncentered continuous covariates make the GLM ill-conditioned; DESeq2
+  itself warns and recommends centering/scaling. Parity is tightest with
+  centered covariates (as is R's own cross-BLAS reproducibility).
+* `betaPrior=TRUE`, LRT, `lfcShrink` (apeglm/ashr), weights, and
+  interaction designs are not implemented.
 
 ## Build
 
 ```bash
 cd rust_deseq2
-cargo build --release
-# binary: target/release/rust_deseq2
+cargo build --release          # binary: target/release/rust_deseq2
+cargo test --release           # (needs RUST_DESEQ2_REF_DIR with R reference files)
 ```
 
-## Command-line usage
+## Usage
 
 ```bash
 ./target/release/rust_deseq2 \
-  --counts   examples/gene_counts.tsv \
-  --coldata  examples/sample_metadata.tsv \
-  --design   group \
-  --contrast-var group --contrast-case tumor --contrast-control normal \
+  --counts   examples/cov_counts.tsv \
+  --coldata  examples/cov_metadata.tsv \
+  --design   "~ batch + condition" \
+  --contrast-var condition --contrast-case trtA --contrast-control ctrl \
   --threads  16 \
   --out      results.tsv
 ```
 
-- **counts TSV**: first column = gene id, header row = sample ids.
-- **colData TSV**: first column = sample id (matching the count header), plus a
-  condition column (e.g. `group`). Sample rows may be in any order — they are
-  aligned to the count matrix by id.
-- **`--threads`**: worker threads for the per-gene fits (default: cores, capped
-  at 16). See [Performance](#performance).
-- **`--dump-prefix`**: optional diagnostic prefix for parity debugging; writes
-  `<prefix>.size_factors.tsv` and `<prefix>.genes.tsv`.
+- **counts TSV**: first column = gene id, header row = sample ids
+  (integer counts, as DESeq2 requires).
+- **colData TSV**: first column = sample id, plus design columns. Rows may
+  be in any order; they are aligned to the count matrix by id.
+- **--design**: additive formula; numeric-looking columns become continuous
+  covariates (`--factor <col>` forces a factor). Factor levels are ordered
+  as R's `factor()` orders them (sorted), first level = reference.
+- **--contrast-***: any pair of levels of a design factor, as in
+  `results(dds, contrast=c(var, case, control))`.
+- **--dump-prefix**: writes per-gene stage diagnostics
+  (dispGeneEst/dispFit/dispMAP/dispersion/maxCooks/...) and size factors,
+  for stage-level comparison against `mcols(dds)`.
 
-## R wrapper
+Output columns: `gene baseMean log2FoldChange lfcSE stat pvalue padj`
+(full precision; `NA` where DESeq2 reports NA).
+
+### R wrapper
 
 ```r
 source("R/rustDESeq2.R")
-
-res <- rustDESeq2(
-  countData = "gene_counts.tsv",
-  colData   = "sample_metadata.tsv",
-  design    = "group",
-  contrast  = c("group", "tumor", "normal")   # c(column, case, control)
-)
-head(res[order(res$padj), ])
+res <- rustDESeq2(countData = "counts.tsv", colData = "meta.tsv",
+                  design = ~ batch + condition,
+                  contrast = c("condition", "trtA", "ctrl"))
 ```
 
-The wrapper calls the binary with `system2()` and reads the output back with
-`read.delim()`, returning a `data.frame`.
-
-> **Binary path.** The wrapper's default `binary=` is the `RUST_DESEQ2_BIN`
-> environment variable, falling back to `target/release/rust_deseq2` relative to
-> the current working directory. Build with `cargo build --release`, or pass
-> `binary = normalizePath("target/release/rust_deseq2")` explicitly.
-
-## Validation
-
-`examples/make_example.R` simulates 400 genes × 12 samples (2 groups) with 60
-truly DE genes, known fold changes, per-sample depth differences and NB
-overdispersion:
+## Validation & examples
 
 ```bash
-Rscript examples/make_example.R      # writes examples/*.tsv
-```
+# simulate datasets
+/opt/R/4.3.3/bin/Rscript examples/make_example.R             # 400 x 12
+/opt/R/4.3.3/bin/Rscript examples/make_example_large.R       # 20k x 16
+/opt/R/4.3.3/bin/Rscript examples/make_example_4v12.R        # 15k, 4 vs 12
+/opt/R/4.3.3/bin/Rscript examples/make_example_covariates.R  # 8k x 24, batch+age+condition
 
-On this dataset rust_deseq2 recovers:
-
-- log2FoldChange vs truth: **Pearson r ≈ 0.92**
-- DE detection at `padj < 0.05`: **sensitivity ≈ 0.97, specificity ≈ 0.98**
-
-### Head-to-head vs. real DESeq2
-
-`examples/compare_deseq2.R` runs Bioconductor **DESeq2 1.42.1** and rust_deseq2
-on the identical dataset and compares them gene-by-gene:
-
-```bash
-/opt/R/4.3.3/bin/Rscript examples/compare_deseq2.R
-```
-
-**Small set — 400 genes × 12 samples:**
-
-| quantity | agreement with DESeq2 |
-|----------|-----------------------|
-| `baseMean` | r = 1.000 (identical) |
-| `log2FoldChange` | r = 1.000, RMSE ≈ 0.0008 |
-| `lfcSE` | r = 0.998 |
-| `stat` (Wald) | r = 0.9999, Spearman = 1.000 |
-| `-log10(pvalue)` | r = 1.000 |
-| LFC vs known truth | DESeq2 r = 0.9220 · rust r = 0.9220 |
-
-DE calls at `padj < 0.05` agree on **all 400 genes** (Jaccard 1.00).
-
-**Large set — 20,000 genes × 16 samples, ~8× depth range** (`examples/make_example_large.R`,
-runs in ~7 s single-threaded):
-
-| quantity | agreement with DESeq2 |
-|----------|-----------------------|
-| `baseMean` | r = 1.000 |
-| `log2FoldChange`, all 19.9k genes | r = 1.000, RMSE ≈ 0.0018 |
-| `log2FoldChange`, `baseMean > 5` (16.9k genes) | r = 1.000, RMSE ≈ 0.001 |
-| `stat` (Wald) | **r = 1.000**, Spearman = 1.000 |
-| `-log10(pvalue)` | **r = 0.9999** |
-| `lfcSE` (all genes) | r = 0.9997 |
-| `lfcSE`, `baseMean > 5` | r = 1.000 |
-| `pvalue = NA` count | 71 (identical to DESeq2) |
-| LFC vs known truth | DESeq2 r = 0.7703 · rust r = 0.7703 |
-
-DE calls at `padj < 0.05` agree on **99.95 %** of genes (Jaccard 0.995; 7
-rust-only, 3 DESeq2-only out of ~2100). Cook's replacement is the main change:
-it makes size factors/baseMean match DESeq2 exactly and reduces large-set LFC
-RMSE from ~0.15 to ~0.0018. Remaining differences are mostly around the
-dispersion trend/MAP estimate and a few genes at the adjusted-p-value boundary.
-
-**Unbalanced set — 15,000 genes, 4 vs 12 samples** (`examples/make_example_4v12.R`),
-stressing the small-group regime:
-
-| quantity | agreement with DESeq2 |
-|----------|-----------------------|
-| `log2FoldChange` | r = 1.000, RMSE ≈ 0.0015 |
-| `lfcSE` | r = 0.9997 |
-| `stat` (Wald) | r = 0.9999 |
-| `-log10(pvalue)` | r = 0.9997 |
-| DE calls @ padj<0.05 | Jaccard 0.991 |
-| LFC vs known truth | DESeq2 r = 0.7336 · rust r = 0.7336 |
-
-Reproduce with:
-
-```bash
-/opt/R/4.3.3/bin/Rscript examples/make_example_large.R
-/opt/R/4.3.3/bin/Rscript examples/compare_deseq2.R \
-  examples/large_counts.tsv examples/large_metadata.tsv examples/large_truth.tsv
+# stage-level + results-level parity vs Bioconductor DESeq2
+/opt/R/4.3.3/bin/Rscript examples/parity_check.R \
+  examples/cov_counts.tsv examples/cov_metadata.tsv \
+  "~ batch + condition" condition trtA ctrl target/release/rust_deseq2
 ```
 
 ## Performance
 
-The per-gene fits (pass 1 dispersion, pass 2 Wald test) are embarrassingly
-parallel and run across `--threads` scoped worker threads (pure `std`, no
-dependencies). Wall-clock, best of 3, vs. single-threaded Bioconductor DESeq2
-(`DESeq()` + `results()`), on one machine; rust timings include TSV read/write:
+Wall-clock on the validation datasets (single machine, `--threads` auto;
+DESeq2 single-threaded, timings include I/O):
 
-| dataset | DESeq2 | rust (auto) | speedup |
-|---------|--------|---------------|---------|
-| 400 × 12    | 1.07 s | 0.06 s | ~18× |
-| 15k × 16 (4v12) | 5.21 s | 0.80 s | ~6.5× |
-| 20k × 16    | 7.05 s | 1.06 s | ~6.6× |
-
-Thread scaling without Cook's replacement is near-linear to ~16 threads. With
-default DESeq2-style replacement, datasets with flagged outliers perform two
-full fits, so the runtime is roughly doubled on those inputs:
-
-| dataset | rust `--threads 1` | rust auto |
-|---------|--------------------|-----------|
-| 400 × 12 | 0.14 s | 0.06 s |
-| 20k × 16 | 14.81 s | 1.06 s |
-| 15k × 16 (4v12) | 11.04 s | 0.80 s |
-
-Single-threaded Rust is slower than DESeq2 on replacement-heavy datasets because
-it performs the extra refit in pure Rust; the wall-clock speedup comes from
-parallel per-gene fitting. Reproduce with:
-
-```bash
-cargo build --release
-/opt/R/4.3.3/bin/Rscript examples/benchmark_time.R 3
-```
+| dataset | DESeq2 1.42.1 | rust_deseq2 | speedup |
+|---|---|---|---|
+| 400 × 12, ~group | 0.8 s | 0.02 s | ~40× |
+| 20k × 16, ~group (with outlier refit) | 6.6 s | 1.3 s | ~5× |
+| 15k × 16, 4 vs 12 | 5.0 s | 1.0 s | ~5× |
+| 8k × 24, ~batch+condition | 14.8 s | 1.1 s | ~13× |
+| 8k × 24, ~batch+age+condition | 9.1 s | 1.3 s | ~7× |
 
 ## Layout
 
 ```
-rust_deseq2/
-├── Cargo.toml
-├── src/
-│   ├── main.rs      # CLI argument parsing + driver
-│   ├── io.rs        # TSV read/write
-│   ├── deseq.rs     # workflow: size factors, design, dispersion trend, Wald
-│   ├── glm.rs       # NB GLM (IRLS) + dispersion MLE/MAP
-│   ├── linalg.rs    # small dense matrix inverse + log-determinant
-│   └── mathx.rs     # ln-gamma, trigamma, NB log-pmf, erfc/normal, BH, median
-├── R/
-│   └── rustDESeq2.R # R wrapper (system2 -> read.delim -> data.frame)
-└── examples/
-    ├── make_example.R        # small synthetic dataset (400 x 12)
-    ├── make_example_large.R  # 20k-gene dataset, varying depth
-    ├── make_example_4v12.R   # 15k-gene unbalanced dataset (4 vs 12)
-    ├── compare_deseq2.R      # head-to-head vs Bioconductor DESeq2
-    ├── parity_deseq2.R       # stage-level DESeq2 internal parity check
-    └── benchmark_time.R      # wall-clock timing vs DESeq2
+src/
+├── main.rs     # CLI
+├── io.rs       # TSV I/O
+├── design.rs   # formula parsing, model matrix, contrasts, cells
+├── deseq.rs    # the staged workflow (dispersions, trend, MAP, Wald,
+│               #  outlier replacement/flagging, filtering)
+├── glm.rs      # fitBeta (QR-IRLS), fitDisp (Armijo), fitDispGrid, optim path
+├── lbfgsb.rs   # port of R 4.3.3 L-BFGS-B + optim's numerical gradient
+├── linalg.rs   # small dense solve/inverse/log-det, Householder QR
+├── rrand.rs    # R RNG ports: Mersenne-Twister/set.seed, norm_rand
+│               #  (inversion + AS241 qnorm), exp_rand, rgamma, rchisq
+├── rloess.rs   # 1-D port of R loess surface="interpolate" (kd-tree,
+│               #  vertex fits, cubic Hermite evaluation)
+└── mathx.rs    # nmath ports: pnorm, lgamma, digamma/trigamma, dnbinom
+                #  (saddle-point), qf, lowess, quantiles, BH, R-style sums
 ```
 
-## References & acknowledgements
+## Real-data validation (GSE144269, 49,579 genes)
+
+Tumor/normal pairs subsampled from the GSE144269 HCC RSEM counts; unpaired
+(`~ tissue`) and paired (`~ patient + tissue`) designs vs DESeq2 1.42.1:
+
+| config | DE calls (both tools) | discordant | max rel diff (padj) | DESeq2 | rust (1 thr) | rust (auto) |
+|---|---|---|---|---|---|---|
+| 3 pairs, unpaired | 676 | 0 | 2e-10 | 9.4 s | 2.1 s | 0.4 s |
+| 3 pairs, paired   | 1217 | 0 | 6e-7 | 10.9 s | 3.0 s | 0.7 s |
+| 6 pairs, unpaired | 2896 | 0 | 1e-5 | 12.0 s | 3.5 s | 0.5 s |
+| 6 pairs, paired   | 3956 | 0 | 4e-5 | 50.7 s | 5.4 s | 0.6 s |
+| 10 pairs, unpaired| 4380 | 0 | 5e-6 | 17.0 s | 5.3 s | 0.7 s |
+| 10 pairs, paired  | 5288 | 0 | 3e-4 | 147.9 s | 10.9 s | 1.0 s |
+
+## References
 
 - Love, Huber & Anders (2014), *Moderated estimation of fold change and
-  dispersion for RNA-seq data with DESeq2*, **Genome Biology** 15:550 — the
-  method this reimplements.
-- The Bioconductor **DESeq2** package (validated here against v1.42.1).
-- [`necoli1822/rust_deseq2`](https://github.com/necoli1822/rust_deseq2), a fuller
-  Rust DESeq2 port (MIT). Studying it informed two numerical-stability choices
-  used here for separated / low-count genes — the weak coefficient **ridge
-  prior** (`λ = 1e-6/ln2²`) and the fitted-mean floor (**`minmu = 0.5`**), both
-  DESeq2 defaults — which raised the low-count fold-change agreement and matched
-  DESeq2's set of untested genes exactly. This implementation is independent and
-  dependency-free (that project uses `ndarray` and adds apeglm/ashr shrinkage,
-  LRT, VST/rlog and multi-factor designs, which are out of scope here).
+  dispersion for RNA-seq data with DESeq2*, Genome Biology 15:550.
+- Bioconductor DESeq2 1.42.1 (R and C++ sources; validation target).
+- R 4.3.3 sources for `pnorm`, `lgamma`, `dpsifn`, `dnbinom`/`dbinom_raw`/
+  `bd0`/`stirlerr`, `lowess`, `p.adjust`, `optim`/`lbfgsb`.
+- Byrd, Lu, Nocedal & Zhu (1995), *A limited memory algorithm for bound
+  constrained optimization* (L-BFGS-B).
